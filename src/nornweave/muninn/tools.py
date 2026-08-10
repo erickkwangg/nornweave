@@ -230,14 +230,15 @@ async def wait_for_reply(
 ) -> dict[str, Any]:
     """Wait for a reply in a thread (experimental).
 
-    Block execution until a new email arrives in a thread.
-    Uses polling to check for new messages.
+    Block execution until a new inbound email arrives in a thread.
+    Uses polling to check for new messages. Outbound messages sent from
+    the inbox while waiting are not treated as replies.
 
     Args:
         client: NornWeave API client.
         thread_id: Thread to wait on.
         timeout_seconds: Maximum wait time (default: 300 seconds / 5 minutes).
-        poll_interval: Seconds between polls (default: 5).
+        poll_interval: Seconds between polls (default: 5, minimum: 1).
 
     Returns:
         The new message content if received, or timeout indicator.
@@ -246,12 +247,14 @@ async def wait_for_reply(
         Exception: If thread not found.
     """
     try:
-        # Get initial message count
-        initial_count = await client.get_thread_message_count(thread_id)
+        thread = await client.get_thread(thread_id)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise Exception(f"Thread '{thread_id}' not found") from e
         raise Exception(f"Failed to access thread: {e.response.status_code}") from e
+
+    seen_count = len(thread.get("messages", []))
+    poll_interval = max(1, poll_interval)
 
     elapsed = 0
     while elapsed < timeout_seconds:
@@ -259,23 +262,25 @@ async def wait_for_reply(
         elapsed += poll_interval
 
         try:
-            current_count = await client.get_thread_message_count(thread_id)
-
-            if current_count > initial_count:
-                # New message arrived
-                latest = await client.get_latest_message(thread_id)
-                if latest:
-                    return {
-                        "received": True,
-                        "message": {
-                            "author": latest.get("author"),
-                            "content": latest.get("content", ""),
-                            "timestamp": latest.get("timestamp"),
-                        },
-                    }
+            thread = await client.get_thread(thread_id)
         except httpx.HTTPStatusError:
             # Ignore transient errors during polling
-            pass
+            continue
+
+        messages = thread.get("messages", [])
+        new_messages = messages[seen_count:]
+        reply = next((m for m in reversed(new_messages) if m.get("role") == "user"), None)
+        if reply is not None:
+            return {
+                "received": True,
+                "message": {
+                    "author": reply.get("author"),
+                    "content": reply.get("content", ""),
+                    "timestamp": reply.get("timestamp"),
+                },
+            }
+        # Only outbound activity since the last poll; don't count it as a reply
+        seen_count = len(messages)
 
     # Timeout reached
     return {
