@@ -87,20 +87,24 @@ async def resend_webhook(
     # Create adapter
     adapter = _get_resend_adapter(settings)
 
-    # Verify webhook signature if secret is configured
-    if settings.resend_webhook_secret:
-        try:
-            headers = {k.lower(): v for k, v in request.headers.items()}
-            adapter.verify_webhook_signature(raw_body, headers)
-            logger.debug("Webhook signature verified successfully")
-        except ResendWebhookError as e:
-            logger.warning("Webhook signature verification failed: %s", e)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=str(e),
-            ) from e
-    else:
-        logger.warning("Webhook secret not configured, skipping signature verification")
+    # Signature verification is mandatory (fail closed, like the Mailgun route):
+    # accepting unsigned webhooks would let anyone inject mail into inboxes.
+    if not settings.resend_webhook_secret:
+        logger.error("RESEND_WEBHOOK_SECRET not configured; rejecting webhook")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Webhook signature verification is not configured",
+        )
+    try:
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        adapter.verify_webhook_signature(raw_body, headers)
+        logger.debug("Webhook signature verified successfully")
+    except ResendWebhookError as e:
+        logger.warning("Webhook signature verification failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(e),
+        ) from e
 
     # Get event type
     event_type = ResendAdapter.get_event_type(payload)
