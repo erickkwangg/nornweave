@@ -13,9 +13,11 @@ from typing import TYPE_CHECKING, Literal
 
 from nornweave.core.domain_filter import DomainFilter
 from nornweave.core.storage import AttachmentMetadata, create_attachment_storage
+from nornweave.models.event import EventType
 from nornweave.models.message import Message, MessageDirection
 from nornweave.models.thread import Thread
 from nornweave.verdandi.attachments import filter_valid_attachments
+from nornweave.verdandi.events import emit_event
 from nornweave.verdandi.parser import html_to_markdown
 from nornweave.verdandi.summarize import generate_thread_summary
 
@@ -234,6 +236,25 @@ async def ingest_message(
 
     if thread_id:
         await generate_thread_summary(storage, thread_id)
+
+    # -------------------------------------------------------------------------
+    # 8. Emit message.received
+    # -------------------------------------------------------------------------
+    try:
+        await emit_event(
+            storage,
+            event_type=EventType.MESSAGE_RECEIVED,
+            inbox_id=inbox.id,
+            thread_id=thread_id,
+            message_id=created_message.id,
+            payload={
+                "from_address": inbound.from_address,
+                "to_address": inbound.to_address,
+                "subject": inbound.subject or "",
+            },
+        )
+    except Exception:
+        logger.exception("Failed to emit message.received for %s", created_message.id)
 
     return IngestResult(
         status="received",

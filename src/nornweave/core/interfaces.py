@@ -308,10 +308,12 @@ class StorageInterface(ABC):
         self,
         *,
         event_type: EventType | None = None,
+        inbox_id: str | None = None,
+        thread_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[Event]:
-        """List events, optionally filtered by type, ordered by created_at DESC."""
+        """List events, optionally filtered, ordered by created_at DESC."""
         ...
 
     # -------------------------------------------------------------------------

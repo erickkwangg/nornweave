@@ -317,13 +317,19 @@ class BaseSQLAlchemyAdapter(StorageInterface):
         self,
         *,
         event_type: EventType | None = None,
+        inbox_id: str | None = None,
+        thread_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[Event]:
-        """List events, optionally filtered by type, ordered by created_at DESC."""
+        """List events, optionally filtered, ordered by created_at DESC."""
         stmt = select(EventORM)
         if event_type is not None:
             stmt = stmt.where(EventORM.type == event_type.value)
+        if inbox_id is not None:
+            stmt = stmt.where(EventORM.inbox_id == inbox_id)
+        if thread_id is not None:
+            stmt = stmt.where(EventORM.thread_id == thread_id)
         stmt = stmt.order_by(EventORM.created_at.desc()).limit(limit).offset(offset)
         result = await self._session.execute(stmt)
         return [row.to_pydantic() for row in result.scalars().all()]

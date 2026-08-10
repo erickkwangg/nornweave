@@ -20,10 +20,12 @@ from nornweave.core.interfaces import (
 )
 from nornweave.core.storage import AttachmentMetadata, create_attachment_storage
 from nornweave.models.attachment import AttachmentUpload, SendAttachment
+from nornweave.models.event import EventType
 from nornweave.models.message import Message, MessageDirection
 from nornweave.models.thread import Thread
 from nornweave.skuld.rate_limiter import GlobalRateLimiter  # noqa: TC001 - needed at runtime
 from nornweave.verdandi.attachments import validate_attachments
+from nornweave.verdandi.events import emit_event
 from nornweave.verdandi.ingest import ingest_message
 from nornweave.verdandi.summarize import generate_thread_summary
 from nornweave.yggdrasil.dependencies import get_email_provider, get_rate_limiter, get_storage
@@ -508,6 +510,22 @@ async def send_message(
         send_status = "sent"
     else:
         send_status = "pending"
+
+    if send_status == "sent":
+        try:
+            await emit_event(
+                storage,
+                event_type=EventType.MESSAGE_SENT,
+                inbox_id=inbox.id,
+                thread_id=thread_id,
+                message_id=created_message.id,
+                payload={
+                    "to_addresses": payload.to,
+                    "subject": payload.subject,
+                },
+            )
+        except Exception:
+            logger.exception("Failed to emit message.sent for %s", created_message.id)
 
     return SendMessageResponse(
         id=created_message.id,

@@ -98,7 +98,15 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     # Include API routers
-    from nornweave.yggdrasil.routes.v1 import attachments, demo, inboxes, messages, search, threads
+    from nornweave.yggdrasil.routes.v1 import (
+        attachments,
+        demo,
+        events,
+        inboxes,
+        messages,
+        search,
+        threads,
+    )
 
     app.include_router(inboxes.router, prefix="/v1", tags=["inboxes"])
     app.include_router(threads.router, prefix="/v1", tags=["threads"])
@@ -106,6 +114,7 @@ def create_app() -> FastAPI:
     app.include_router(search.router, prefix="/v1", tags=["search"])
     app.include_router(attachments.router, prefix="/v1", tags=["attachments"])
     app.include_router(demo.router, prefix="/v1", tags=["demo"])
+    app.include_router(events.router, prefix="/v1", tags=["events"])
 
     # Include webhook routers
     from nornweave.yggdrasil.routes.webhooks import mailgun, resend, sendgrid, ses
