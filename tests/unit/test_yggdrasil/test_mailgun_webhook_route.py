@@ -119,3 +119,85 @@ class TestMailgunWebhookRouteVerification:
             "thread_id": "th-456",
         }
         mock_ingest.assert_awaited_once()
+
+
+@pytest.mark.unit
+class TestMailgunWebhookAttachments:
+    """Attachment file parts must be extracted and passed to ingestion."""
+
+    def test_attachments_extracted_from_multipart(self) -> None:
+        app = _make_app("mailgun-signing-key")
+        client = TestClient(app)
+        form_data = _mailgun_form(signing_key="mailgun-signing-key")
+        form_data["attachment-count"] = "2"
+        form_data["content-id-map"] = '{"<logo-cid>": "attachment-2"}'
+
+        with patch(
+            "nornweave.yggdrasil.routes.webhooks.mailgun.ingest_message",
+            new_callable=AsyncMock,
+        ) as mock_ingest:
+            mock_ingest.return_value = SimpleNamespace(
+                status="received", message_id="msg-1", thread_id="th-1"
+            )
+            response = client.post(
+                "/webhooks/mailgun",
+                data=form_data,
+                files=[
+                    ("attachment-1", ("report.pdf", b"%PDF-1.4 fake", "application/pdf")),
+                    ("attachment-2", ("logo.png", b"\x89PNG fake", "image/png")),
+                ],
+            )
+
+        assert response.status_code == 200
+        inbound = mock_ingest.await_args.args[0]
+        assert len(inbound.attachments) == 2
+
+        pdf = inbound.attachments[0]
+        assert pdf.filename == "report.pdf"
+        assert pdf.content_type == "application/pdf"
+        assert pdf.content == b"%PDF-1.4 fake"
+        assert pdf.size_bytes == len(b"%PDF-1.4 fake")
+        assert pdf.disposition.value == "attachment"
+        assert pdf.content_id is None
+
+        logo = inbound.attachments[1]
+        assert logo.filename == "logo.png"
+        assert logo.content_id == "logo-cid"
+        assert logo.disposition.value == "inline"
+
+    def test_no_attachments_yields_empty_list(self) -> None:
+        app = _make_app("mailgun-signing-key")
+        client = TestClient(app)
+        form_data = _mailgun_form(signing_key="mailgun-signing-key")
+
+        with patch(
+            "nornweave.yggdrasil.routes.webhooks.mailgun.ingest_message",
+            new_callable=AsyncMock,
+        ) as mock_ingest:
+            mock_ingest.return_value = SimpleNamespace(
+                status="received", message_id="msg-1", thread_id="th-1"
+            )
+            response = client.post("/webhooks/mailgun", data=form_data)
+
+        assert response.status_code == 200
+        inbound = mock_ingest.await_args.args[0]
+        assert inbound.attachments == []
+
+    def test_malformed_count_and_map_are_tolerated(self) -> None:
+        app = _make_app("mailgun-signing-key")
+        client = TestClient(app)
+        form_data = _mailgun_form(signing_key="mailgun-signing-key")
+        form_data["attachment-count"] = "not-a-number"
+        form_data["content-id-map"] = "{broken json"
+
+        with patch(
+            "nornweave.yggdrasil.routes.webhooks.mailgun.ingest_message",
+            new_callable=AsyncMock,
+        ) as mock_ingest:
+            mock_ingest.return_value = SimpleNamespace(
+                status="received", message_id="msg-1", thread_id="th-1"
+            )
+            response = client.post("/webhooks/mailgun", data=form_data)
+
+        assert response.status_code == 200
+        assert mock_ingest.await_args.args[0].attachments == []

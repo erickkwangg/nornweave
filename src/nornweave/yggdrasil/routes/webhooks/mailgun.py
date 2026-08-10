@@ -1,19 +1,67 @@
 """Mailgun webhook handler."""
 
+import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from starlette.datastructures import FormData, UploadFile
 
 from nornweave.adapters.mailgun import MailgunAdapter, MailgunWebhookError
 from nornweave.core.config import Settings, get_settings
 from nornweave.core.interfaces import (
-    StorageInterface,  # noqa: TC001 - needed at runtime for FastAPI
+    InboundAttachment,
+    StorageInterface,
 )
+from nornweave.models.attachment import AttachmentDisposition
 from nornweave.verdandi.ingest import ingest_message
 from nornweave.yggdrasil.dependencies import get_storage
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+async def _extract_attachments(form_data: FormData) -> list[InboundAttachment]:
+    """Read attachment-N file parts from Mailgun's multipart payload.
+
+    Mailgun posts attachment-count plus attachment-1..N file fields, and a
+    content-id-map JSON object ({"<cid>": "attachment-N"}) for inline parts.
+    """
+    content_id_by_field: dict[str, str] = {}
+    raw_map = form_data.get("content-id-map")
+    if isinstance(raw_map, str) and raw_map:
+        try:
+            content_id_by_field = {
+                field_name: str(cid).strip("<>") for cid, field_name in json.loads(raw_map).items()
+            }
+        except json.JSONDecodeError, AttributeError:
+            logger.warning("Ignoring malformed content-id-map: %s", raw_map)
+
+    try:
+        count = int(str(form_data.get("attachment-count") or 0))
+    except ValueError:
+        count = 0
+
+    attachments: list[InboundAttachment] = []
+    for i in range(1, count + 1):
+        field_name = f"attachment-{i}"
+        upload = form_data.get(field_name)
+        if not isinstance(upload, UploadFile):
+            continue
+        content = await upload.read()
+        content_id = content_id_by_field.get(field_name)
+        attachments.append(
+            InboundAttachment(
+                filename=upload.filename or field_name,
+                content_type=upload.content_type or "application/octet-stream",
+                content=content,
+                size_bytes=len(content),
+                disposition=(
+                    AttachmentDisposition.INLINE if content_id else AttachmentDisposition.ATTACHMENT
+                ),
+                content_id=content_id,
+            )
+        )
+    return attachments
 
 
 def _get_mailgun_adapter(settings: Settings) -> MailgunAdapter:
@@ -72,6 +120,10 @@ async def mailgun_webhook(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to parse webhook payload: {e}",
         ) from e
+
+    # Attachment file parts need async reads, so they are extracted here
+    # rather than in the adapter's sync parse.
+    inbound.attachments = await _extract_attachments(form_data)
 
     # Delegate to shared ingestion pipeline
     result = await ingest_message(inbound, storage, settings)
