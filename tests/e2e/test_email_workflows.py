@@ -1383,3 +1383,78 @@ class TestOutboundThreadingHeaders:
         msg = (await e2e_client.get(f"/v1/messages/{response.json()['id']}")).json()
         assert msg["cc_addresses"] == ["carol@example.com"]
         assert msg["bcc_addresses"] == ["dave@example.com"]
+
+
+@pytest.mark.asyncio
+class TestSendAttachmentLimits:
+    """Outbound attachment validation rejects the send before anything is stored."""
+
+    async def test_blocked_extension_rejected(
+        self,
+        e2e_client: AsyncClient,
+        mock_provider: MockEmailProvider,
+    ) -> None:
+        import base64
+
+        inbox_response = await e2e_client.post(
+            "/v1/inboxes",
+            json={"name": "Limits", "email_username": "limits"},
+        )
+        inbox_id = inbox_response.json()["id"]
+
+        response = await e2e_client.post(
+            "/v1/messages",
+            json={
+                "inbox_id": inbox_id,
+                "to": ["bob@example.com"],
+                "subject": "Payload",
+                "body": "See attached",
+                "attachments": [
+                    {
+                        "filename": "malware.exe",
+                        "content_type": "application/octet-stream",
+                        "content_base64": base64.b64encode(b"MZ fake").decode(),
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 422
+        assert "Blocked file type" in response.json()["detail"]
+        assert mock_provider.sent_emails == []
+
+    async def test_too_many_attachments_rejected(
+        self,
+        e2e_client: AsyncClient,
+        mock_provider: MockEmailProvider,
+    ) -> None:
+        import base64
+
+        inbox_response = await e2e_client.post(
+            "/v1/inboxes",
+            json={"name": "Limits2", "email_username": "limits2"},
+        )
+        inbox_id = inbox_response.json()["id"]
+
+        content = base64.b64encode(b"x").decode()
+        response = await e2e_client.post(
+            "/v1/messages",
+            json={
+                "inbox_id": inbox_id,
+                "to": ["bob@example.com"],
+                "subject": "Too many",
+                "body": "See attached",
+                "attachments": [
+                    {
+                        "filename": f"file{i}.txt",
+                        "content_type": "text/plain",
+                        "content_base64": content,
+                    }
+                    for i in range(21)  # default ATTACHMENT_MAX_COUNT is 20
+                ],
+            },
+        )
+
+        assert response.status_code == 422
+        assert "Too many attachments" in response.json()["detail"]
+        assert mock_provider.sent_emails == []

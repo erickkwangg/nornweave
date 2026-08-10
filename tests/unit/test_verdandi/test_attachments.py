@@ -8,6 +8,7 @@ from nornweave.verdandi.attachments import (
     MAX_SINGLE_ATTACHMENT_SIZE,
     MAX_TOTAL_ATTACHMENT_SIZE,
     build_content_id_to_filename_map,
+    filter_valid_attachments,
     guess_content_type,
     normalize_content_id,
     parse_attachment_info_json,
@@ -280,3 +281,52 @@ class TestBlockedExtensions:
         assert ".pdf" not in BLOCKED_EXTENSIONS
         assert ".jpg" not in BLOCKED_EXTENSIONS
         assert ".docx" not in BLOCKED_EXTENSIONS
+
+
+class TestFilterValidAttachments:
+    """Tests for filter_valid_attachments (inbound drop-and-keep semantics)."""
+
+    def _att(self, filename: str, size: int) -> InboundAttachment:
+        return InboundAttachment(
+            filename=filename,
+            content_type="application/octet-stream",
+            content=b"x" * min(size, 10),  # content only matters for size_bytes
+            size_bytes=size,
+        )
+
+    def test_all_valid_kept(self) -> None:
+        atts = [self._att("a.pdf", 100), self._att("b.txt", 200)]
+        kept, dropped = filter_valid_attachments(atts)
+        assert kept == atts
+        assert dropped == []
+
+    def test_oversized_dropped_others_kept(self) -> None:
+        atts = [self._att("small.pdf", 100), self._att("big.bin", 2_000_000)]
+        kept, dropped = filter_valid_attachments(atts, max_single_size=1_000_000)
+        assert [a.filename for a in kept] == ["small.pdf"]
+        assert len(dropped) == 1
+        assert "big.bin" in dropped[0]
+
+    def test_blocked_extension_dropped(self) -> None:
+        atts = [self._att("safe.pdf", 100), self._att("evil.exe", 100)]
+        kept, dropped = filter_valid_attachments(atts)
+        assert [a.filename for a in kept] == ["safe.pdf"]
+        assert "evil.exe" in dropped[0]
+
+    def test_count_limit_enforced(self) -> None:
+        atts = [self._att(f"f{i}.txt", 10) for i in range(5)]
+        kept, dropped = filter_valid_attachments(atts, max_count=3)
+        assert len(kept) == 3
+        assert len(dropped) == 2
+        assert "count limit" in dropped[0]
+
+    def test_total_size_limit_enforced(self) -> None:
+        atts = [self._att("a.txt", 600), self._att("b.txt", 600), self._att("c.txt", 100)]
+        kept, dropped = filter_valid_attachments(atts, max_total_size=1_000)
+        # b.txt exceeds the running total; c.txt still fits
+        assert [a.filename for a in kept] == ["a.txt", "c.txt"]
+        assert len(dropped) == 1
+        assert "b.txt" in dropped[0]
+
+    def test_empty_list(self) -> None:
+        assert filter_valid_attachments([]) == ([], [])

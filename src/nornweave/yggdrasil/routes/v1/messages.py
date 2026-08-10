@@ -14,6 +14,7 @@ from nornweave.core.config import Settings, get_settings
 from nornweave.core.domain_filter import DomainFilter
 from nornweave.core.interfaces import (
     EmailProvider,
+    InboundAttachment,
     InboundMessage,
     StorageInterface,
 )
@@ -22,6 +23,7 @@ from nornweave.models.attachment import AttachmentUpload, SendAttachment
 from nornweave.models.message import Message, MessageDirection
 from nornweave.models.thread import Thread
 from nornweave.skuld.rate_limiter import GlobalRateLimiter  # noqa: TC001 - needed at runtime
+from nornweave.verdandi.attachments import validate_attachments
 from nornweave.verdandi.ingest import ingest_message
 from nornweave.verdandi.summarize import generate_thread_summary
 from nornweave.yggdrasil.dependencies import get_email_provider, get_rate_limiter, get_storage
@@ -317,8 +319,10 @@ async def send_message(
         # Create storage backend
         storage_backend = create_attachment_storage(settings)
 
+        # Decode everything first so size/count limits are enforced before
+        # any attachment is stored.
+        decoded: list[tuple[AttachmentUpload, bytes]] = []
         for i, attachment in enumerate(payload.attachments):
-            # Validate and decode base64 content
             try:
                 content_bytes = base64.b64decode(attachment.content_base64)
             except (binascii.Error, ValueError) as e:
@@ -332,7 +336,29 @@ async def send_message(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=f"Attachment {i} has empty content",
                 )
+            decoded.append((attachment, content_bytes))
 
+        validation = validate_attachments(
+            [
+                InboundAttachment(
+                    filename=attachment.filename,
+                    content_type=attachment.content_type,
+                    content=b"",  # size check only needs size_bytes
+                    size_bytes=len(content_bytes),
+                )
+                for attachment, content_bytes in decoded
+            ],
+            max_single_size=settings.attachment_max_size_mb * 1024 * 1024,
+            max_total_size=settings.attachment_max_total_size_mb * 1024 * 1024,
+            max_count=settings.attachment_max_count,
+        )
+        if not validation.valid:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Attachment validation failed: {'; '.join(validation.errors)}",
+            )
+
+        for attachment, content_bytes in decoded:
             # Generate attachment ID and store
             attachment_id = str(uuid.uuid4())
 

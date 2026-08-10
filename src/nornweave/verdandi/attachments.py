@@ -288,6 +288,56 @@ def validate_attachments(
     )
 
 
+def filter_valid_attachments(
+    attachments: list[InboundAttachment],
+    *,
+    max_single_size: int = MAX_SINGLE_ATTACHMENT_SIZE,
+    max_total_size: int = MAX_TOTAL_ATTACHMENT_SIZE,
+    max_count: int = MAX_ATTACHMENT_COUNT,
+    check_extensions: bool = True,
+) -> tuple[list[InboundAttachment], list[str]]:
+    """
+    Split attachments into those passing validation and reasons for the rest.
+
+    Unlike validate_attachments (all-or-nothing, for rejecting outbound sends),
+    this keeps every attachment that individually fits the limits, so an
+    inbound email is never dropped wholesale over one bad attachment.
+
+    Returns:
+        (kept, dropped_reasons)
+    """
+    kept: list[InboundAttachment] = []
+    dropped: list[str] = []
+    total_size = 0
+
+    for att in attachments:
+        if len(kept) >= max_count:
+            dropped.append(f"{att.filename}: attachment count limit ({max_count}) reached")
+            continue
+
+        single = validate_attachments(
+            [att],
+            max_single_size=max_single_size,
+            max_total_size=max_total_size,
+            max_count=1,
+            check_extensions=check_extensions,
+        )
+        if not single.valid:
+            dropped.append(f"{att.filename}: {'; '.join(single.errors)}")
+            continue
+
+        if total_size + att.size_bytes > max_total_size:
+            dropped.append(
+                f"{att.filename}: total size limit ({max_total_size / 1024 / 1024:.1f}MB) exceeded"
+            )
+            continue
+
+        total_size += att.size_bytes
+        kept.append(att)
+
+    return kept, dropped
+
+
 def _get_extension(filename: str) -> str:
     """Get the file extension from a filename."""
     if not filename:

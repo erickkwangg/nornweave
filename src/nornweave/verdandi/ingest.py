@@ -15,6 +15,7 @@ from nornweave.core.domain_filter import DomainFilter
 from nornweave.core.storage import AttachmentMetadata, create_attachment_storage
 from nornweave.models.message import Message, MessageDirection
 from nornweave.models.thread import Thread
+from nornweave.verdandi.attachments import filter_valid_attachments
 from nornweave.verdandi.parser import html_to_markdown
 from nornweave.verdandi.summarize import generate_thread_summary
 
@@ -172,7 +173,16 @@ async def ingest_message(
     if inbound.attachments:
         storage_backend = create_attachment_storage(settings)
 
-        for att in inbound.attachments:
+        valid_attachments, dropped = filter_valid_attachments(
+            inbound.attachments,
+            max_single_size=settings.attachment_max_size_mb * 1024 * 1024,
+            max_total_size=settings.attachment_max_total_size_mb * 1024 * 1024,
+            max_count=settings.attachment_max_count,
+        )
+        for reason in dropped:
+            logger.warning("Dropping inbound attachment: %s", reason)
+
+        for att in valid_attachments:
             if att.content and att.size_bytes > 0:
                 try:
                     attachment_id = str(uuid.uuid4())

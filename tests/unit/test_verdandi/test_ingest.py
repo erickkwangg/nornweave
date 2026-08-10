@@ -55,6 +55,9 @@ def _make_settings(
     settings = MagicMock()
     settings.attachment_storage_backend = "local"
     settings.attachment_local_path = "/tmp/test-attachments"
+    settings.attachment_max_size_mb = 25
+    settings.attachment_max_total_size_mb = 35
+    settings.attachment_max_count = 20
     settings.inbound_domain_allowlist = inbound_domain_allowlist
     settings.inbound_domain_blocklist = inbound_domain_blocklist
     return settings
@@ -306,3 +309,57 @@ async def test_ingest_unlisted_domain_rejected_when_allowlist_active() -> None:
     assert result.status == "domain_blocked"
     storage.create_message.assert_not_awaited()
     storage.create_thread.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Attachment limit enforcement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_ingest_drops_invalid_attachments_keeps_message() -> None:
+    """Oversized/blocked attachments are dropped; the message and valid attachments survive."""
+    from nornweave.core.interfaces import InboundAttachment
+
+    inbox = _make_inbox()
+    storage = _make_storage(inbox=inbox)
+    storage.create_attachment = AsyncMock()
+    settings = _make_settings()
+    settings.attachment_max_size_mb = 1  # 1 MB cap for the test
+
+    inbound = _make_inbound()
+    inbound.attachments = [
+        InboundAttachment(
+            filename="ok.pdf",
+            content_type="application/pdf",
+            content=b"small",
+            size_bytes=5,
+        ),
+        InboundAttachment(
+            filename="huge.bin",
+            content_type="application/octet-stream",
+            content=b"x",
+            size_bytes=2 * 1024 * 1024,  # 2 MB > 1 MB cap
+        ),
+        InboundAttachment(
+            filename="evil.exe",
+            content_type="application/octet-stream",
+            content=b"x",
+            size_bytes=5,
+        ),
+    ]
+
+    mock_backend = AsyncMock()
+    mock_backend.store = AsyncMock(
+        return_value=MagicMock(size_bytes=5, storage_key="key", backend="local", content_hash="h")
+    )
+    with patch("nornweave.verdandi.ingest.create_attachment_storage", return_value=mock_backend):
+        result = await ingest_message(inbound, storage, settings)
+
+    assert result.status == "received"
+    # Only the valid attachment was stored
+    assert mock_backend.store.await_count == 1
+    assert storage.create_attachment.await_count == 1
+    stored_filename = storage.create_attachment.await_args.kwargs["filename"]
+    assert stored_filename == "ok.pdf"
