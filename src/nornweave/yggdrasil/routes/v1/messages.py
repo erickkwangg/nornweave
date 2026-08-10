@@ -74,6 +74,12 @@ class SendMessageRequest(BaseModel):
     subject: str = Field(..., min_length=1)
     body: str = Field(..., description="Markdown body content")
     reply_to_thread_id: str | None = None
+    cc: list[str] | None = Field(None, description="CC recipients")
+    bcc: list[str] | None = Field(None, description="BCC recipients")
+    reply_to: str | None = Field(None, description="Reply-To address")
+    html_body: str | None = Field(
+        None, description="Pre-rendered HTML body (otherwise body is converted from Markdown)"
+    )
     attachments: list[AttachmentUpload] | None = Field(
         None, description="Optional list of attachments to send"
     )
@@ -87,6 +93,39 @@ class SendMessageResponse(BaseModel):
     provider_message_id: str | None
     status: str
     error: str | None = None
+
+
+def _rfc_msgid(raw: str | None) -> str | None:
+    """Best-effort RFC 5322 Message-ID for threading headers.
+
+    Stored provider ids from inbound mail carry angle brackets already; some
+    provider APIs return bare ids (Resend returns a UUID that is not a wire
+    Message-ID at all, so ids without an @ are unusable and dropped).
+    """
+    if not raw:
+        return None
+    if raw.startswith("<") and raw.endswith(">"):
+        return raw
+    if "@" in raw:
+        return f"<{raw}>"
+    return None
+
+
+def _build_reply_headers(thread_messages: list[Message]) -> tuple[str | None, list[str] | None]:
+    """Derive In-Reply-To and References from the thread's latest addressable message."""
+    for msg in reversed(thread_messages):
+        parent_id = _rfc_msgid(msg.provider_message_id)
+        if parent_id is None:
+            continue
+        references: list[str] = []
+        for ref in msg.references or []:
+            ref_id = _rfc_msgid(ref)
+            if ref_id and ref_id not in references:
+                references.append(ref_id)
+        if parent_id not in references:
+            references.append(parent_id)
+        return parent_id, references
+    return None, None
 
 
 def _message_to_response(msg: Message) -> MessageResponse:
@@ -211,15 +250,14 @@ async def send_message(
             detail=f"Inbox {payload.inbox_id} not found",
         )
 
-    # Outbound domain filtering (allow/blocklist)
-    # NOTE: When cc/bcc fields are added to SendMessageRequest, include them here.
+    # Outbound domain filtering (allow/blocklist) across all recipient fields
     outbound_filter = DomainFilter(
         allowlist=settings.outbound_domain_allowlist,
         blocklist=settings.outbound_domain_blocklist,
         direction="outbound",
     )
     blocked_domains: list[str] = []
-    for recipient in payload.to:
+    for recipient in [*payload.to, *(payload.cc or []), *(payload.bcc or [])]:
         if not outbound_filter.check(recipient):
             _, _, domain = recipient.rpartition("@")
             blocked_domains.append(domain or recipient)
@@ -241,8 +279,11 @@ async def send_message(
             headers={"Retry-After": str(rate_limiter.retry_after_header(rl_result))},
         )
 
-    # Get or create thread
+    # Get or create thread; for replies, derive RFC threading headers from the
+    # thread history so recipients' mail clients thread the reply correctly.
     thread_id: str
+    reply_in_reply_to: str | None = None
+    reply_references: list[str] | None = None
     if payload.reply_to_thread_id:
         thread = await storage.get_thread(payload.reply_to_thread_id)
         if thread is None:
@@ -251,6 +292,8 @@ async def send_message(
                 detail=f"Thread {payload.reply_to_thread_id} not found",
             )
         thread_id = thread.id
+        thread_messages = await storage.list_messages_for_thread(thread_id)
+        reply_in_reply_to, reply_references = _build_reply_headers(thread_messages)
     else:
         # Create a new thread
         new_thread = Thread(
@@ -348,6 +391,12 @@ async def send_message(
             subject=payload.subject,
             body=payload.body,
             from_address=inbox.email_address,
+            reply_to=payload.reply_to,
+            in_reply_to=reply_in_reply_to,
+            references=reply_references,
+            cc=payload.cc,
+            bcc=payload.bcc,
+            html_body=payload.html_body,
             attachments=provider_attachments if provider_attachments else None,
         )
     except Exception:
@@ -371,6 +420,12 @@ async def send_message(
         direction=MessageDirection.OUTBOUND,
         text=payload.body,
         extracted_text=payload.body,  # Already markdown
+        html=payload.html_body,
+        cc=payload.cc,
+        bcc=payload.bcc,
+        reply_to=[payload.reply_to] if payload.reply_to else None,
+        in_reply_to=reply_in_reply_to,
+        references=reply_references,
         headers={
             "to": ",".join(payload.to),  # Join list into comma-separated string
             "subject": payload.subject,
@@ -405,7 +460,7 @@ async def send_message(
 
     # Demo mode loopback: deliver a copy to each recipient that is a demo inbox
     if settings.email_provider == "demo" and provider_message_id:
-        for recipient in payload.to:
+        for recipient in [*payload.to, *(payload.cc or [])]:
             recipient_inbox = await storage.get_inbox_by_email(recipient)
             if recipient_inbox is None:
                 continue
@@ -415,6 +470,8 @@ async def send_message(
                 subject=payload.subject,
                 body_plain=payload.body,
                 message_id=provider_message_id,
+                in_reply_to=reply_in_reply_to,
+                references=reply_references or [],
                 timestamp=datetime.now(UTC),
             )
             await ingest_message(inbound, storage, settings)

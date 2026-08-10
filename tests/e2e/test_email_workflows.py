@@ -1256,3 +1256,130 @@ On Sat, Jan 31, 2026 at 2:00 PM Support wrote:
             f"Original question appeared {occurrences} times but should appear only once. "
             "Quoted content should be stripped for de-duplication."
         )
+
+
+@pytest.mark.asyncio
+class TestOutboundThreadingHeaders:
+    """Replies must carry RFC threading headers so recipients' clients thread them."""
+
+    async def test_new_message_has_no_threading_headers(
+        self,
+        e2e_client: AsyncClient,
+        mock_provider: MockEmailProvider,
+    ) -> None:
+        inbox_response = await e2e_client.post(
+            "/v1/inboxes",
+            json={"name": "Headers Test", "email_username": "headers"},
+        )
+        inbox_id = inbox_response.json()["id"]
+
+        await e2e_client.post(
+            "/v1/messages",
+            json={
+                "inbox_id": inbox_id,
+                "to": ["bob@example.com"],
+                "subject": "Fresh Start",
+                "body": "No parents here",
+            },
+        )
+        sent = mock_provider.sent_emails[-1]
+        assert sent.in_reply_to is None
+        assert sent.references == []
+
+    async def test_reply_carries_in_reply_to_and_references(
+        self,
+        e2e_client: AsyncClient,
+        e2e_storage: SQLiteAdapter,
+        mock_provider: MockEmailProvider,
+    ) -> None:
+        inbox_response = await e2e_client.post(
+            "/v1/inboxes",
+            json={"name": "Reply Headers", "email_username": "replyheaders"},
+        )
+        inbox_id = inbox_response.json()["id"]
+        inbox_email = inbox_response.json()["email_address"]
+
+        # Outbound message opens the thread
+        send_response = await e2e_client.post(
+            "/v1/messages",
+            json={
+                "inbox_id": inbox_id,
+                "to": ["customer@example.com"],
+                "subject": "Quote",
+                "body": "Here is your quote.",
+            },
+        )
+        thread_id = send_response.json()["thread_id"]
+        outbound_msgid = mock_provider.sent_emails[-1].provider_message_id
+
+        # Customer replies (inbound)
+        inbound = InboundMessage(
+            from_address="customer@example.com",
+            to_address=inbox_email,
+            subject="Re: Quote",
+            body_plain="Can you do 10% less?",
+            message_id="<customer-reply-1@example.com>",
+            in_reply_to=outbound_msgid,
+            references=[outbound_msgid],
+            timestamp=datetime.utcnow(),
+        )
+        await ingest_inbound_message(e2e_storage, inbox_id, inbound)
+
+        # Agent replies via API
+        reply_response = await e2e_client.post(
+            "/v1/messages",
+            json={
+                "inbox_id": inbox_id,
+                "to": ["customer@example.com"],
+                "subject": "Re: Quote",
+                "body": "Yes, we can.",
+                "reply_to_thread_id": thread_id,
+            },
+        )
+        assert reply_response.status_code == 201
+
+        sent = mock_provider.sent_emails[-1]
+        assert sent.in_reply_to == "<customer-reply-1@example.com>"
+        assert sent.references == [outbound_msgid, "<customer-reply-1@example.com>"]
+
+        # Headers are also persisted on the outbound message record
+        message_id = reply_response.json()["id"]
+        msg_response = await e2e_client.get(f"/v1/messages/{message_id}")
+        assert msg_response.json()["in_reply_to"] == "<customer-reply-1@example.com>"
+
+    async def test_cc_bcc_reply_to_and_html_passed_to_provider(
+        self,
+        e2e_client: AsyncClient,
+        mock_provider: MockEmailProvider,
+    ) -> None:
+        inbox_response = await e2e_client.post(
+            "/v1/inboxes",
+            json={"name": "CC Test", "email_username": "cctest"},
+        )
+        inbox_id = inbox_response.json()["id"]
+
+        response = await e2e_client.post(
+            "/v1/messages",
+            json={
+                "inbox_id": inbox_id,
+                "to": ["bob@example.com"],
+                "cc": ["carol@example.com"],
+                "bcc": ["dave@example.com"],
+                "reply_to": "humans@example.com",
+                "subject": "Copies",
+                "body": "**bold**",
+                "html_body": "<p><b>bold</b></p>",
+            },
+        )
+        assert response.status_code == 201
+
+        sent = mock_provider.sent_emails[-1]
+        assert sent.cc == ["carol@example.com"]
+        assert sent.bcc == ["dave@example.com"]
+        assert sent.reply_to == "humans@example.com"
+        assert sent.html_body == "<p><b>bold</b></p>"
+
+        # cc/bcc are persisted on the message record
+        msg = (await e2e_client.get(f"/v1/messages/{response.json()['id']}")).json()
+        assert msg["cc_addresses"] == ["carol@example.com"]
+        assert msg["bcc_addresses"] == ["dave@example.com"]

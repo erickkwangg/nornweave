@@ -9,8 +9,79 @@ from nornweave.models.message import Message, MessageDirection
 from nornweave.yggdrasil.routes.v1.messages import (
     MessageListResponse,
     MessageResponse,
+    _build_reply_headers,
     _message_to_response,
+    _rfc_msgid,
 )
+
+
+def _make_message(
+    message_id: str,
+    provider_message_id: str | None,
+    references: list[str] | None = None,
+) -> Message:
+    return Message(
+        message_id=message_id,
+        thread_id="th_1",
+        inbox_id="ibx_1",
+        direction=MessageDirection.INBOUND,
+        provider_message_id=provider_message_id,
+        references=references,
+    )
+
+
+class TestRfcMsgid:
+    """Tests for _rfc_msgid normalization."""
+
+    def test_bracketed_id_passes_through(self) -> None:
+        assert _rfc_msgid("<abc@mail.example.com>") == "<abc@mail.example.com>"
+
+    def test_bare_id_with_at_gets_brackets(self) -> None:
+        assert _rfc_msgid("abc@mail.example.com") == "<abc@mail.example.com>"
+
+    def test_provider_api_id_without_at_is_dropped(self) -> None:
+        # e.g. Resend returns a UUID that is not a wire Message-ID
+        assert _rfc_msgid("49a3999c-0ce1-4ea6-ab68-afcd6dc2e794") is None
+
+    def test_none_and_empty(self) -> None:
+        assert _rfc_msgid(None) is None
+        assert _rfc_msgid("") is None
+
+
+class TestBuildReplyHeaders:
+    """Tests for _build_reply_headers derivation from thread history."""
+
+    def test_empty_thread_returns_none(self) -> None:
+        assert _build_reply_headers([]) == (None, None)
+
+    def test_single_parent_message(self) -> None:
+        parent = _make_message("m1", "<orig@example.com>")
+        in_reply_to, references = _build_reply_headers([parent])
+        assert in_reply_to == "<orig@example.com>"
+        assert references == ["<orig@example.com>"]
+
+    def test_uses_latest_message_and_extends_chain(self) -> None:
+        first = _make_message("m1", "<orig@example.com>")
+        reply = _make_message("m2", "<reply@example.com>", references=["<orig@example.com>"])
+        in_reply_to, references = _build_reply_headers([first, reply])
+        assert in_reply_to == "<reply@example.com>"
+        assert references == ["<orig@example.com>", "<reply@example.com>"]
+
+    def test_skips_messages_without_usable_id(self) -> None:
+        first = _make_message("m1", "<orig@example.com>")
+        failed = _make_message("m2", None)
+        api_id_only = _make_message("m3", "49a3999c-0ce1-4ea6-ab68-afcd6dc2e794")
+        in_reply_to, references = _build_reply_headers([first, failed, api_id_only])
+        assert in_reply_to == "<orig@example.com>"
+        assert references == ["<orig@example.com>"]
+
+    def test_deduplicates_references(self) -> None:
+        msg = _make_message(
+            "m1", "<a@example.com>", references=["<a@example.com>", "<b@example.com>"]
+        )
+        in_reply_to, references = _build_reply_headers([msg])
+        assert in_reply_to == "<a@example.com>"
+        assert references == ["<a@example.com>", "<b@example.com>"]
 
 
 class TestMessageResponse:
